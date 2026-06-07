@@ -1,4 +1,4 @@
-const CACHE_NAME = "cashier-app-v20260528_invoice1-stockpath-final3";
+const CACHE_NAME = "cashier-app-v20260607-manual-invoice-stock-v5";
 const APP_SHELL = [
   "./",
   "./index.html",

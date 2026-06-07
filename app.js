@@ -30,9 +30,9 @@ const PREFIX = "DFDFG";
 const STORE_PRODUCTS_PATH = "productsMohanad";
 const STORE_ORDERS_PATH = "ordersMohanad";
 const LOCAL_SESSION_KEY = `${PREFIX}_USER_SESSION`;
-const LOCAL_OFFLINE_DB_NAME = `${PREFIX}_offline_cashier_db_v6`;
-const LOCAL_OFFLINE_DB_VERSION = 6;
-const BACKUP_VERSION = 6;
+const LOCAL_OFFLINE_DB_NAME = `${PREFIX}_offline_cashier_db_bbbb_v9`;
+const LOCAL_OFFLINE_DB_VERSION = 9;
+const BACKUP_VERSION = 9;
 
 let currentStoreId = localStorage.getItem("activeStoreId") || "default";
 let cart = [];
@@ -121,6 +121,10 @@ function baseClientPath() {
   const key = currentLicenseKey();
   if (!key) return null;
   return `${PREFIX}_clients/${sanitizeKey(key)}`;
+}
+
+function canUseCloud() {
+  return isOnline() && !!currentLicenseKey() && !!baseClientPath();
 }
 
 function pathLicenses() { return `${PREFIX}_licenses`; }
@@ -1455,9 +1459,16 @@ function addToCart(product) {
   } else {
     cart.push({
       lineKey: key,
-      id: safeProduct.id,
+      id: String(safeProduct.id || safeProduct.__key || safeProduct.firebaseKey || safeProduct.code || Date.now()),
+      productId: String(safeProduct.id || safeProduct.__key || safeProduct.firebaseKey || ""),
+      cashierProductKey: String(safeProduct.__key || safeProduct.firebaseKey || safeProduct.cashierProductKey || safeProduct.id || ""),
+      firebaseKey: String(safeProduct.firebaseKey || safeProduct.__key || safeProduct.id || ""),
+      __key: String(safeProduct.__key || safeProduct.firebaseKey || safeProduct.id || ""),
+      linkedStoreProductId: String(safeProduct.linkedStoreProductId || ""),
       name: safeProduct.name,
-      code: safeProduct.code,
+      code: safeProduct.code || safeProduct.barcode || safeProduct.cashierBarcode || "",
+      barcode: safeProduct.barcode || safeProduct.code || safeProduct.cashierBarcode || "",
+      cashierBarcode: safeProduct.cashierBarcode || safeProduct.barcode || safeProduct.code || "",
       price: Number(safeProduct.price || 0),
       cost: Number(safeProduct.cost || 0),
       stock: Number(safeProduct.stock || 0),
@@ -1553,7 +1564,7 @@ async function changeCartVariant(lineKey, size, colorKey = "") {
   if (!line) return;
 
   const products = await getAllProducts();
-  const fresh = products.find(p => p.id === line.id);
+  const fresh = findProductForStockLine(products, line);
   if (!fresh) return;
 
   const matrix = safeVariantMatrix(fresh.variantMatrix, fresh.variants, fresh.stock);
@@ -1594,7 +1605,7 @@ async function changeQty(lineKey, delta) {
   if (!line) return;
 
   const products = await getAllProducts();
-  const fresh = products.find(p => p.id === line.id);
+  const fresh = findProductForStockLine(products, line);
   if (!fresh) return;
 
   line.variantMatrix = safeVariantMatrix(fresh.variantMatrix, fresh.variants, fresh.stock);
@@ -1650,7 +1661,7 @@ async function getNextInvoiceNumber() {
   const next = current + 1;
   await idbSet("meta", { id: "invoiceCounter", value: next });
 
-  if (isOnline() && getLocalSession()?.appMode === "online") {
+  if (canUseCloud()) {
     await set(ref(db, `${pathClientCounters()}/invoiceAutoNumber`), next);
   }
 
@@ -1732,7 +1743,7 @@ function expandInvoiceItemsToStockLines(items) {
 
 async function applyStockChange(items, direction) {
   const products = await getAllProducts();
-  const onlineSync = isOnline() && getLocalSession()?.appMode === "online";
+  const onlineSync = canUseCloud();
 
   for (const item of expandInvoiceItemsToStockLines(items)) {
     let p = findProductForStockLine(products, item);
@@ -1780,13 +1791,13 @@ async function applyStockChange(items, direction) {
 
       const updatedProduct = { ...(result.snapshot.val() || {}), id: String(result.snapshot.val()?.id || p.id || productKey), __key: productKey, firebaseKey: productKey };
       await idbSet("products", updatedProduct);
-      const idx = products.findIndex(x => x.id === p.id);
+      const idx = products.findIndex(x => String(x.id) === String(p.id) || String(x.__key || x.firebaseKey || "") === String(p.__key || p.firebaseKey || ""));
       if (idx >= 0) products[idx] = updatedProduct;
       await syncCashierProductToLinkedStore(updatedProduct);
     } else {
       const updated = mutateProductStockForLine(p, item, direction);
       await saveEntity("products", p.id, updated);
-      const idx = products.findIndex(x => x.id === p.id);
+      const idx = products.findIndex(x => String(x.id) === String(p.id) || String(x.__key || x.firebaseKey || "") === String(p.__key || p.firebaseKey || ""));
       if (idx >= 0) products[idx] = updated;
     }
   }
@@ -1892,7 +1903,11 @@ async function checkout() {
         await applyStockChange(newInvoice.items || [], -1);
         newStockDeducted = true;
         try {
-          await saveEntity("invoices", editingInvoiceId, newInvoice);
+          newInvoice.id = String(editingInvoiceId);
+          newInvoice.firebaseKey = String(editingInvoiceId);
+          newInvoice.__key = String(editingInvoiceId);
+          newInvoice.updatedAt = new Date().toISOString();
+          await saveInvoiceGuaranteed(newInvoice);
         } catch (saveError) {
           if (newStockDeducted) await applyStockChange(newInvoice.items || [], +1);
           await applyStockChange(oldInvoice.items || [], -1);
@@ -1913,11 +1928,17 @@ async function checkout() {
 
     await showLoader("جاري إنشاء الفاتورة وخصم المخزون...");
     const invoiceNumber = await getNextInvoiceNumber();
-    const invoice = await buildInvoicePayload(invoiceNumber);
+    const invoiceId = `INV_${Date.now()}_${invoiceNumber}`;
+    const invoice = await buildInvoicePayload(invoiceId);
+    invoice.number = invoiceNumber;
+    invoice.firebaseKey = invoiceId;
+    invoice.__key = invoiceId;
+    invoice.createdAt = invoice.createdAt || new Date().toISOString();
+    invoice.updatedAt = new Date().toISOString();
 
     await applyStockChange(invoice.items || [], -1);
     try {
-      await saveEntity("invoices", invoice.id, invoice);
+      await saveInvoiceGuaranteed(invoice);
     } catch (saveError) {
       await applyStockChange(invoice.items || [], +1);
       throw saveError;
@@ -1925,7 +1946,9 @@ async function checkout() {
 
     currentInvoiceId = invoice.id;
     clearInvoiceEditor();
-    showToast("تم إنشاء الفاتورة وخصم المخزون", "success");
+    showToast("تم إنشاء الفاتورة وحفظها وخصم المخزون", "success");
+    await renderInvoices();
+    await renderReports();
     await viewInvoice(invoice.id);
   } catch (error) {
     console.error("Checkout failed", error);
@@ -2057,7 +2080,7 @@ async function viewInvoice(id) {
 
   if (qs("invPageStoreName")) qs("invPageStoreName").innerText = store.name || "المحل";
   setImageOrHide(qs("invPageLogo"), store.logo);
-  if (qs("invPageId")) qs("invPageId").innerText = `#${id}`;
+  if (qs("invPageId")) qs("invPageId").innerText = `#${inv.number || id}`;
   if (qs("invPageDate")) qs("invPageDate").innerText = new Date(inv.date).toLocaleString("ar-EG");
   if (qs("invPageCustomer")) qs("invPageCustomer").innerText = inv.customer || "-";
   if (qs("invPagePhone")) qs("invPagePhone").innerText = inv.phone || "-";
@@ -2335,18 +2358,17 @@ async function renderInvoices() {
   const invoices = await getAllInvoices();
   const filtered = invoices
     .filter(inv =>
-      inv.storeId === currentStoreId &&
-      (String(inv.id).includes(query) || (inv.customer || "").toLowerCase().includes(query) || (inv.phone || "").toLowerCase().includes(query)) &&
+      (String(inv.id || "").includes(query) || String(inv.number || "").includes(query) || (inv.customer || "").toLowerCase().includes(query) || (inv.phone || "").toLowerCase().includes(query)) &&
       (statusFilter === "all" || (inv.status || "paid") === statusFilter)
     )
-    .sort((a, b) => Number(b.id) - Number(a.id));
+    .sort((a, b) => new Date(b.date || b.createdAt || 0).getTime() - new Date(a.date || a.createdAt || 0).getTime());
 
   const visible = filtered.slice(0, invoicesCurrentLimit);
 
   visible.forEach(inv => {
     table.innerHTML += `
       <tr class="border-b hover:bg-gray-50">
-        <td class="p-4 font-bold">#${inv.id}</td>
+        <td class="p-4 font-bold">#${escapeHtml(inv.number || inv.id)}</td>
         <td class="p-4 text-xs text-gray-400">${new Date(inv.date).toLocaleString("ar-EG")}</td>
         <td class="p-4">
           <button onclick="openCustomerHistory('${escapeJs(inv.customer || "")}','${escapeJs(inv.phone || "")}')" class="text-blue-700 font-bold hover:underline">
@@ -3316,7 +3338,7 @@ async function openCustomerHistory(name, phone = "") {
       filtered.forEach(inv => {
         tbody.innerHTML += `
           <tr class="border-t">
-            <td class="p-4 font-bold">#${inv.id}</td>
+            <td class="p-4 font-bold">#${escapeHtml(inv.number || inv.id)}</td>
             <td class="p-4 text-sm">${new Date(inv.date).toLocaleString("ar-EG")}</td>
             <td class="p-4"><span class="status-pill ${statusClass(inv.status || "paid")}">${statusLabel(inv.status || "paid")}</span></td>
             <td class="p-4 font-bold">${Number(inv.total || 0).toFixed(2)} ${escapeHtml(inv.currencySymbol || "₪")}</td>
@@ -3959,8 +3981,48 @@ async function idbClear(storeName) {
   });
 }
 
+async function saveInvoiceGuaranteed(invoice) {
+  if (!invoice || !invoice.id) throw new Error("بيانات الفاتورة غير مكتملة");
+  const invoiceKey = String(invoice.firebaseKey || invoice.__key || invoice.id).trim();
+  const payload = {
+    ...invoice,
+    id: String(invoice.id),
+    firebaseKey: invoiceKey,
+    __key: invoiceKey,
+    storeId: invoice.storeId || currentStoreId || "default",
+    source: invoice.source || "pos",
+    status: invoice.status || "paid",
+    savedAt: invoice.savedAt || new Date().toISOString(),
+    updatedAt: new Date().toISOString()
+  };
+  await idbSet("invoices", payload);
+  if (canUseCloud()) {
+    const invoiceRef = ref(db, `${pathClientInvoices()}/${invoiceKey}`);
+    await set(invoiceRef, payload);
+    const verify = await get(invoiceRef);
+    if (!verify.exists()) {
+      throw new Error("تمت محاولة حفظ الفاتورة لكن لم تظهر في Firebase");
+    }
+    await idbSet("invoices", { ...(verify.val() || payload), id: String((verify.val() || payload).id || payload.id), firebaseKey: invoiceKey, __key: invoiceKey });
+  }
+  return payload;
+}
+
 async function getEntity(kind, id) {
-  return await idbGet(kind, id);
+  let row = await idbGet(kind, id);
+  if (!row && kind === "invoices") {
+    const all = await idbGetAll("invoices");
+    row = all.find(x => String(x.id) === String(id) || String(x.firebaseKey || x.__key || "") === String(id) || String(x.number || "") === String(id)) || null;
+    if (!row && canUseCloud()) {
+      const direct = await get(ref(db, `${pathClientInvoices()}/${id}`)).catch(() => null);
+      if (direct?.exists()) {
+        const val = direct.val() || {};
+        row = { ...val, id: String(val.id || id), firebaseKey: String(val.firebaseKey || id), __key: String(val.__key || id) };
+        await idbSet("invoices", row);
+      }
+    }
+  }
+  return row;
 }
 
 async function syncCashierProductToLinkedStore(product) {
@@ -4005,20 +4067,24 @@ async function syncCashierProductToLinkedStore(product) {
 }
 
 async function saveEntity(kind, id, payload) {
+  id = String(id || payload?.id || `${kind}_${Date.now()}`);
   if (kind === "products") {
     payload = { ...payload, id: String(payload.id || id), __key: String(payload.__key || payload.firebaseKey || id), firebaseKey: String(payload.firebaseKey || payload.__key || id) };
   }
+  if (kind === "invoices") {
+    payload = { ...payload, id: String(payload.id || id), __key: String(payload.__key || payload.firebaseKey || id), firebaseKey: String(payload.firebaseKey || payload.__key || id), storeId: payload.storeId || currentStoreId || "default" };
+  }
   await idbSet(kind, payload);
 
-  const session = getLocalSession();
-  if (isOnline() && session?.appMode === "online") {
+  if (canUseCloud()) {
     const pathMap = {
       stores: pathClientStores(),
       products: pathClientProducts(),
       invoices: pathClientInvoices(),
       purchases: pathClientPurchases()
     };
-    await set(ref(db, `${pathMap[kind]}/${id}`), payload);
+    const basePath = pathMap[kind];
+    if (basePath) await set(ref(db, `${basePath}/${payload.__key || payload.firebaseKey || id}`), payload);
     if (kind === "products") {
       await syncCashierProductToLinkedStore({ ...payload, id });
     }
@@ -4026,17 +4092,19 @@ async function saveEntity(kind, id, payload) {
 }
 
 async function deleteEntity(kind, id) {
+  const existing = await getEntity(kind, id);
   await idbDelete(kind, id);
 
-  const session = getLocalSession();
-  if (isOnline() && session?.appMode === "online") {
+  if (canUseCloud()) {
     const pathMap = {
       stores: pathClientStores(),
       products: pathClientProducts(),
       invoices: pathClientInvoices(),
       purchases: pathClientPurchases()
     };
-    await remove(ref(db, `${pathMap[kind]}/${id}`));
+    const basePath = pathMap[kind];
+    const key = String(existing?.__key || existing?.firebaseKey || id);
+    if (basePath) await remove(ref(db, `${basePath}/${key}`));
   }
 }
 
@@ -4157,3 +4225,470 @@ window.openManualInvoiceModal = openManualInvoiceModal;
 window.saveManualInvoice = saveManualInvoice;
 
 safeCreateIcons();
+
+/****************************************************************************************
+ * MANUAL INVOICE ENGINE V5 - إصلاح جذري لإنشاء فاتورة الكاشير اليدوية
+ * - يحفظ الفاتورة في DFDFG_clients/{license}/invoices
+ * - يخصم مخزون المقاس/اللون من DFDFG_clients/{license}/products
+ * - يدمج البيانات من Firebase و IndexedDB حتى لا تختفي الفاتورة من شاشة الفواتير
+ * - يزامن مخزون المنتج المرتبط بالمتجر عبر الباركود
+ ****************************************************************************************/
+const MANUAL_INVOICE_ENGINE_VERSION = "v20260607_manual_invoice_stock_rewrite";
+const __origGetAllProductsV5 = getAllProducts;
+const __origGetAllInvoicesV5 = getAllInvoices;
+const __origGetEntityV5 = getEntity;
+
+function normalizeKeyV5(value) {
+  return String(value ?? "").trim();
+}
+
+function makeChildKeyV5(value, fallbackPrefix = "key") {
+  const raw = normalizeKeyV5(value) || `${fallbackPrefix}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  return raw.replace(/[.#$/\[\]]/g, "_");
+}
+
+function uniqueByKeyV5(items, getKey) {
+  const map = new Map();
+  for (const item of items || []) {
+    if (!item) continue;
+    const key = normalizeKeyV5(getKey(item)) || normalizeKeyV5(item.id) || normalizeKeyV5(item.__key) || normalizeKeyV5(item.firebaseKey) || Math.random().toString(36);
+    map.set(key, { ...(map.get(key) || {}), ...item });
+  }
+  return [...map.values()];
+}
+
+function normalizeProductRecordV5(product = {}, firebaseKey = "") {
+  const key = makeChildKeyV5(firebaseKey || product.__key || product.firebaseKey || product.cashierProductKey || product.id || product.code, "p");
+  const normalized = {
+    ...(product || {}),
+    id: normalizeKeyV5(product.id || key),
+    __key: normalizeKeyV5(product.__key || product.firebaseKey || key),
+    firebaseKey: normalizeKeyV5(product.firebaseKey || product.__key || key),
+    cashierProductKey: normalizeKeyV5(product.cashierProductKey || product.__key || product.firebaseKey || key),
+    code: normalizeKeyV5(product.code || product.barcode || product.cashierBarcode),
+    barcode: normalizeKeyV5(product.barcode || product.code || product.cashierBarcode),
+    cashierBarcode: normalizeKeyV5(product.cashierBarcode || product.barcode || product.code),
+    storeId: product.storeId || currentStoreId || "default"
+  };
+  const matrix = safeVariantMatrix(normalized.variantMatrix, normalized.variants, normalized.stock);
+  normalized.variantMatrix = matrix;
+  normalized.variants = flattenVariantsFromMatrix(matrix);
+  normalized.colorOptions = extractColorOptionsFromMatrix(matrix);
+  normalized.sizes = matrix.map(row => row.size);
+  normalized.stock = matrix.length ? matrixTotal(matrix) : Math.max(0, Number(normalized.stock || 0));
+  return normalized;
+}
+
+function normalizeInvoiceRecordV5(invoice = {}, firebaseKey = "") {
+  const id = normalizeKeyV5(invoice.id || firebaseKey || `INV_${Date.now()}`);
+  const key = makeChildKeyV5(firebaseKey || invoice.firebaseKey || invoice.__key || id, "inv");
+  return {
+    ...(invoice || {}),
+    id,
+    __key: normalizeKeyV5(invoice.__key || invoice.firebaseKey || key),
+    firebaseKey: normalizeKeyV5(invoice.firebaseKey || invoice.__key || key),
+    storeId: invoice.storeId || currentStoreId || "default",
+    source: invoice.source || "pos",
+    status: invoice.status || "paid"
+  };
+}
+
+async function readCloudProductsV5() {
+  if (!canUseCloud()) return [];
+  try {
+    const snap = await get(ref(db, pathClientProducts()));
+    if (!snap.exists()) return [];
+    return Object.entries(snap.val() || {}).map(([key, value]) => normalizeProductRecordV5(value || {}, key));
+  } catch (error) {
+    console.warn("readCloudProductsV5 skipped", error);
+    return [];
+  }
+}
+
+async function readCloudInvoicesV5() {
+  if (!canUseCloud()) return [];
+  try {
+    const snap = await get(ref(db, pathClientInvoices()));
+    if (!snap.exists()) return [];
+    return Object.entries(snap.val() || {}).map(([key, value]) => normalizeInvoiceRecordV5(value || {}, key));
+  } catch (error) {
+    console.warn("readCloudInvoicesV5 skipped", error);
+    return [];
+  }
+}
+
+getAllProducts = async function getAllProductsV5() {
+  const local = (await __origGetAllProductsV5()).map(item => normalizeProductRecordV5(item));
+  const cloud = await readCloudProductsV5();
+  const merged = uniqueByKeyV5([...local, ...cloud], p => p.__key || p.firebaseKey || p.id || p.code);
+  for (const product of merged) {
+    try { await idbSet("products", product); } catch {}
+  }
+  return merged;
+};
+
+getAllInvoices = async function getAllInvoicesV5() {
+  const local = (await __origGetAllInvoicesV5()).map(item => normalizeInvoiceRecordV5(item));
+  const cloud = await readCloudInvoicesV5();
+  const merged = uniqueByKeyV5([...local, ...cloud], inv => inv.firebaseKey || inv.__key || inv.id || inv.number);
+  for (const invoice of merged) {
+    try { await idbSet("invoices", invoice); } catch {}
+  }
+  return merged;
+};
+
+getEntity = async function getEntityV5(kind, id) {
+  const wanted = normalizeKeyV5(id);
+  if (!wanted) return null;
+  if (kind === "invoices") {
+    const invoices = await getAllInvoices();
+    return invoices.find(inv => [inv.id, inv.__key, inv.firebaseKey, inv.number].map(normalizeKeyV5).includes(wanted)) || null;
+  }
+  if (kind === "products") {
+    const products = await getAllProducts();
+    return products.find(p => [p.id, p.__key, p.firebaseKey, p.cashierProductKey, p.code, p.barcode, p.cashierBarcode].map(normalizeKeyV5).includes(wanted)) || null;
+  }
+  return await __origGetEntityV5(kind, id);
+};
+
+function valuesForLineMatchingV5(item = {}) {
+  const keys = [item.cashierProductKey, item.firebaseKey, item.__key, item.productKey, item.id, item.productId, item.cashierProductId]
+    .map(normalizeKeyV5).filter(Boolean);
+  const codes = [item.code, item.barcode, item.cashierBarcode]
+    .map(normalizeKeyV5).filter(Boolean);
+  const names = [item.name, item.productName].map(normalizeKeyV5).filter(Boolean);
+  return { keys, codes, names };
+}
+
+async function resolveProductForLineV5(item) {
+  const products = await getAllProducts();
+  const { keys, codes, names } = valuesForLineMatchingV5(item);
+  let found = products.find(p => keys.some(k => [p.__key, p.firebaseKey, p.cashierProductKey, p.id, p.productId, p.cashierProductId].map(normalizeKeyV5).includes(k)));
+  if (!found) found = products.find(p => codes.some(c => [p.code, p.barcode, p.cashierBarcode].map(normalizeKeyV5).includes(c)));
+  if (!found && names.length) {
+    const byName = products.filter(p => names.includes(normalizeKeyV5(p.name || p.productName)));
+    if (byName.length === 1) found = byName[0];
+  }
+  return found ? normalizeProductRecordV5(found, found.__key || found.firebaseKey || found.id) : null;
+}
+
+function lineLabelV5(line = {}) {
+  return `${line.name || line.productName || "منتج"} / ${line.selectedSize || line.selectedVariant || line.size || "بدون مقاس"} / ${line.selectedColorName || line.colorName || "لون"}`;
+}
+
+function findRowForLineV5(matrix, line) {
+  const wantedSize = normalizeKeyV5(line.selectedSize || line.selectedVariant || line.size || "");
+  if (wantedSize) {
+    const exact = matrix.find(r => normalizeKeyV5(r.size) === wantedSize);
+    if (exact) return exact;
+  }
+  if (matrix.length === 1) return matrix[0];
+  return matrix[0] || null;
+}
+
+function findColorForLineV5(row, line) {
+  const wantedKey = normalizeKeyV5(line.selectedColorKey || line.colorKey || "");
+  const wantedName = normalizeKeyV5(line.selectedColorName || line.colorName || "");
+  const wantedCode = normalizeHexColor(line.selectedColorCode || line.colorCode || "#cccccc");
+  const colors = row?.colors || [];
+  return colors.find(c => wantedKey && normalizeKeyV5(c.key) === wantedKey)
+    || colors.find(c => wantedName && normalizeKeyV5(c.name) === wantedName && normalizeHexColor(c.code || "#cccccc") === wantedCode)
+    || colors.find(c => wantedName && normalizeKeyV5(c.name) === wantedName)
+    || colors.find(c => normalizeHexColor(c.code || "#cccccc") === wantedCode && (wantedCode !== "#cccccc" || colors.length === 1))
+    || (colors.length === 1 ? colors[0] : null);
+}
+
+function normalizeInvoiceLinesV5(items = []) {
+  const grouped = new Map();
+  for (const item of items || []) {
+    const qty = Math.max(1, Number(item.qty || item.quantity || 1));
+    const units = Array.isArray(item.unitSelections) && item.unitSelections.length ? item.unitSelections : null;
+    const lines = units
+      ? units.map(unit => ({
+          ...item,
+          selectedSize: unit.size || unit.selectedSize || item.selectedSize || item.selectedVariant || item.size || "بدون مقاس",
+          selectedVariant: unit.size || unit.selectedVariant || item.selectedVariant || item.selectedSize || item.size || "بدون مقاس",
+          selectedColorKey: unit.colorKey || unit.selectedColorKey || item.selectedColorKey || item.colorKey || "",
+          selectedColorName: unit.colorName || unit.selectedColorName || item.selectedColorName || item.colorName || "",
+          selectedColorCode: unit.colorCode || unit.selectedColorCode || item.selectedColorCode || item.colorCode || "#cccccc",
+          qty: 1
+        }))
+      : [{ ...item, qty }];
+
+    for (const line of lines) {
+      const { keys, codes } = valuesForLineMatchingV5(line);
+      const productToken = keys[0] || codes[0] || normalizeKeyV5(line.name) || "product";
+      const compound = [
+        productToken,
+        normalizeKeyV5(line.selectedSize || line.selectedVariant || line.size || ""),
+        normalizeKeyV5(line.selectedColorKey || line.colorKey || ""),
+        normalizeKeyV5(line.selectedColorName || line.colorName || ""),
+        normalizeHexColor(line.selectedColorCode || line.colorCode || "#cccccc")
+      ].join("__");
+      if (!grouped.has(compound)) grouped.set(compound, { ...line, qty: 0 });
+      grouped.get(compound).qty += Math.max(1, Number(line.qty || 1));
+    }
+  }
+  return [...grouped.values()];
+}
+
+function mutateStockForLineV5(product, line, direction) {
+  const qty = Math.max(1, Number(line.qty || line.quantity || 1));
+  const delta = Number(direction || 0) * qty;
+  let matrix = safeVariantMatrix(product.variantMatrix, product.variants, product.stock);
+  const baseStock = Math.max(0, Number(product.stock || 0));
+
+  if (!matrix.length) {
+    matrix = [{
+      size: normalizeKeyV5(line.selectedSize || line.selectedVariant || line.size || "بدون مقاس") || "بدون مقاس",
+      colors: [{
+        key: normalizeKeyV5(line.selectedColorKey || line.colorKey || "default") || "default",
+        name: normalizeKeyV5(line.selectedColorName || line.colorName || "افتراضي") || "افتراضي",
+        code: normalizeHexColor(line.selectedColorCode || line.colorCode || "#cccccc"),
+        image: "",
+        stock: baseStock
+      }]
+    }];
+  }
+
+  const row = findRowForLineV5(matrix, line);
+  if (!row) throw new Error(`لا يوجد مقاس لهذا المنتج: ${lineLabelV5(line)}`);
+
+  const color = findColorForLineV5(row, line);
+  if (!color) throw new Error(`لا يوجد لون لهذا المنتج: ${lineLabelV5(line)}`);
+
+  const before = Math.max(0, Number(color.stock || 0));
+  const after = before + delta;
+  if (after < 0) {
+    throw new Error(`المخزون غير كافٍ للمنتج: ${lineLabelV5(line)}. المتاح ${before} والمطلوب ${qty}`);
+  }
+
+  color.stock = after;
+  const normalizedKey = normalizeKeyV5(product.__key || product.firebaseKey || product.cashierProductKey || product.id || line.cashierProductKey || line.id);
+  const updated = normalizeProductRecordV5({
+    ...product,
+    variantMatrix: matrix,
+    variants: flattenVariantsFromMatrix(matrix),
+    colorOptions: extractColorOptionsFromMatrix(matrix),
+    sizes: matrix.map(r => r.size),
+    stock: matrixTotal(matrix),
+    updatedAt: new Date().toISOString()
+  }, normalizedKey);
+  return updated;
+}
+
+async function writeProductAfterStockV5(product, line, direction) {
+  const resolvedKey = makeChildKeyV5(product.__key || product.firebaseKey || product.cashierProductKey || product.id || line.cashierProductKey || line.id || line.code, "p");
+  if (canUseCloud()) {
+    let failureMessage = "";
+    const productRef = ref(db, `${pathClientProducts()}/${resolvedKey}`);
+    const result = await transaction(productRef, current => {
+      try {
+        const base = normalizeProductRecordV5(current || product, resolvedKey);
+        return mutateStockForLineV5(base, line, direction);
+      } catch (error) {
+        failureMessage = error?.message || "فشل تعديل المخزون";
+        return;
+      }
+    });
+    if (!result.committed) throw new Error(failureMessage || `فشل خصم المخزون: ${lineLabelV5(line)}`);
+    const updated = normalizeProductRecordV5(result.snapshot.val() || {}, resolvedKey);
+    await idbSet("products", updated);
+    await syncCashierProductToLinkedStore(updated);
+    return updated;
+  }
+
+  const updated = mutateStockForLineV5(product, line, direction);
+  await idbSet("products", updated);
+  return updated;
+}
+
+applyStockChange = async function applyStockChangeV5(items, direction) {
+  const lines = normalizeInvoiceLinesV5(items || []);
+  const applied = [];
+  try {
+    for (const line of lines) {
+      const product = await resolveProductForLineV5(line);
+      if (!product) {
+        throw new Error(`المنتج غير موجود للخصم: ${line.name || line.productName || line.code || line.barcode || "منتج"}`);
+      }
+      await writeProductAfterStockV5(product, line, direction);
+      applied.push(line);
+    }
+    return applied;
+  } catch (error) {
+    if (Number(direction) < 0 && applied.length) {
+      try { await applyStockChangeV5(applied, +1); } catch (rollbackError) { console.warn("rollback failed", rollbackError); }
+    }
+    throw error;
+  }
+};
+
+saveInvoiceGuaranteed = async function saveInvoiceGuaranteedV5(invoice) {
+  if (!invoice || !invoice.id) throw new Error("بيانات الفاتورة غير مكتملة");
+  const invoiceKey = makeChildKeyV5(invoice.firebaseKey || invoice.__key || invoice.id, "inv");
+  const payload = normalizeInvoiceRecordV5({
+    ...invoice,
+    id: normalizeKeyV5(invoice.id),
+    firebaseKey: invoiceKey,
+    __key: invoiceKey,
+    storeId: invoice.storeId || currentStoreId || "default",
+    source: invoice.source || "pos",
+    status: invoice.status || "paid",
+    savedAt: invoice.savedAt || new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    engineVersion: MANUAL_INVOICE_ENGINE_VERSION
+  }, invoiceKey);
+
+  await idbSet("invoices", payload);
+
+  if (canUseCloud()) {
+    const invoiceRef = ref(db, `${pathClientInvoices()}/${invoiceKey}`);
+    await set(invoiceRef, payload);
+    const verify = await get(invoiceRef);
+    if (!verify.exists()) throw new Error("الفاتورة لم تُحفظ في Firebase بعد الكتابة");
+    const saved = normalizeInvoiceRecordV5(verify.val() || payload, invoiceKey);
+    await idbSet("invoices", saved);
+    return saved;
+  }
+
+  return payload;
+};
+
+async function validateCartAgainstStockV5() {
+  if (!Array.isArray(cart) || !cart.length) {
+    alert("أضف منتجات إلى الفاتورة أولاً");
+    return false;
+  }
+  const lines = normalizeInvoiceLinesV5(cart);
+  for (const line of lines) {
+    const product = await resolveProductForLineV5(line);
+    if (!product) {
+      alert(`المنتج غير موجود: ${line.name || line.code || "منتج"}`);
+      return false;
+    }
+    const test = mutateStockForLineV5(product, line, -Math.max(1, Number(line.qty || 1)) / Math.max(1, Number(line.qty || 1)));
+    void test;
+  }
+  return true;
+}
+
+async function checkoutV5() {
+  if (checkoutV5._busy) return;
+  if (!Array.isArray(cart) || !cart.length) {
+    alert("أضف منتجات إلى الفاتورة أولاً");
+    return;
+  }
+
+  const btn = qs("createInvoiceBtn");
+  checkoutV5._busy = true;
+  if (btn) {
+    btn.disabled = true;
+    btn.style.opacity = "0.7";
+    btn.innerText = "جاري إنشاء الفاتورة...";
+  }
+
+  let deductedLines = [];
+  let oldInvoiceRestored = false;
+
+  try {
+    await showLoader(editingInvoiceId ? "جاري تعديل الفاتورة وخصم المخزون..." : "جاري حفظ الفاتورة وخصم المخزون...");
+
+    if (editingInvoiceId) {
+      const oldInvoice = await getEntity("invoices", editingInvoiceId);
+      if (!oldInvoice) throw new Error("الفاتورة الأصلية غير موجودة");
+      await applyStockChange(oldInvoice.items || [], +1);
+      oldInvoiceRestored = true;
+      if (!(await validateCartAgainstStockV5())) {
+        await applyStockChange(oldInvoice.items || [], -1);
+        return;
+      }
+      const edited = await buildInvoicePayload(editingInvoiceId);
+      edited.id = String(editingInvoiceId);
+      edited.firebaseKey = makeChildKeyV5(oldInvoice.firebaseKey || oldInvoice.__key || editingInvoiceId, "inv");
+      edited.__key = edited.firebaseKey;
+      edited.number = oldInvoice.number || edited.number || editingInvoiceId;
+      edited.createdAt = oldInvoice.createdAt || oldInvoice.date || new Date().toISOString();
+      edited.updatedAt = new Date().toISOString();
+      edited.engineVersion = MANUAL_INVOICE_ENGINE_VERSION;
+      deductedLines = await applyStockChange(edited.items || [], -1);
+      const saved = await saveInvoiceGuaranteed(edited);
+      currentInvoiceId = saved.id;
+      editingInvoiceId = null;
+      clearInvoiceEditor();
+      showToast("تم تعديل الفاتورة وخصم المخزون", "success");
+      await renderProducts();
+      await renderInvoices();
+      await renderReports();
+      await viewInvoice(saved.id);
+      return;
+    }
+
+    if (!(await validateCartAgainstStockV5())) return;
+
+    const invoiceNumber = await getNextInvoiceNumber();
+    const invoiceId = `INV_${Date.now()}_${invoiceNumber}`;
+    const invoice = await buildInvoicePayload(invoiceId);
+    invoice.id = invoiceId;
+    invoice.number = invoiceNumber;
+    invoice.firebaseKey = makeChildKeyV5(invoiceId, "inv");
+    invoice.__key = invoice.firebaseKey;
+    invoice.createdAt = invoice.createdAt || invoice.date || new Date().toISOString();
+    invoice.updatedAt = new Date().toISOString();
+    invoice.engineVersion = MANUAL_INVOICE_ENGINE_VERSION;
+
+    deductedLines = await applyStockChange(invoice.items || [], -1);
+    const saved = await saveInvoiceGuaranteed(invoice);
+
+    currentInvoiceId = saved.id;
+    clearInvoiceEditor();
+    showToast("تم حفظ الفاتورة وخصم المخزون", "success");
+    await renderProducts();
+    await renderInvoices();
+    await renderReports();
+    await viewInvoice(saved.id);
+  } catch (error) {
+    console.error("checkoutV5 failed", error);
+    if (deductedLines.length) {
+      try { await applyStockChange(deductedLines, +1); } catch (rollbackError) { console.warn("invoice stock rollback failed", rollbackError); }
+    }
+    if (editingInvoiceId && oldInvoiceRestored) {
+      try {
+        const oldInvoice = await getEntity("invoices", editingInvoiceId);
+        if (oldInvoice) await applyStockChange(oldInvoice.items || [], -1);
+      } catch {}
+    }
+    hideLoaderImmediate();
+    alert(error?.message || "فشل إنشاء الفاتورة أو خصم المخزون");
+  } finally {
+    checkoutV5._busy = false;
+    if (btn) {
+      btn.disabled = false;
+      btn.style.opacity = "";
+      updateCreateInvoiceButton();
+    }
+  }
+}
+
+checkout = checkoutV5;
+window.checkout = checkoutV5;
+window.saveInvoiceGuaranteed = saveInvoiceGuaranteed;
+window.applyStockChange = applyStockChange;
+
+function installManualInvoiceButtonV5() {
+  const btn = qs("createInvoiceBtn");
+  if (!btn || btn.dataset.manualInvoiceEngine === MANUAL_INVOICE_ENGINE_VERSION) return;
+  const cleanBtn = btn.cloneNode(true);
+  cleanBtn.dataset.manualInvoiceEngine = MANUAL_INVOICE_ENGINE_VERSION;
+  cleanBtn.type = "button";
+  cleanBtn.addEventListener("click", checkoutV5);
+  btn.parentNode.replaceChild(cleanBtn, btn);
+  updateCreateInvoiceButton();
+}
+
+document.addEventListener("DOMContentLoaded", () => {
+  setTimeout(installManualInvoiceButtonV5, 300);
+  setTimeout(installManualInvoiceButtonV5, 1200);
+  setTimeout(installManualInvoiceButtonV5, 2500);
+});
+setTimeout(installManualInvoiceButtonV5, 1500);
